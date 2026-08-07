@@ -39,7 +39,7 @@
   // ---- SoundTouchJS (bundled inline, no external CDN dependency) ------
   // Source: soundtouchjs v0.1.30 (LGPL) by Olli Parviainen / Ryan Berdeen /
   // Jakub Fiala / Steve 'Cutter' Blades. Inlined here so the player has zero
-  // runtime dependency on any external script host — avoids failures from
+  // runtime dependency on any external script host â avoids failures from
   // wifi filters, ad/tracker blockers, or CDN outages blocking a 3rd-party
   // domain.
   const SOUNDTOUCH_SRC = `/*
@@ -918,7 +918,7 @@ export { AbstractFifoSamplePipe, PitchShifter, RateTransposer, SimpleFilter, Sou
       const clamped = Math.max(0, Math.min(1, frac));
       // NOTE: the underlying library's percentagePlayed getter returns
       // 0-100, but its setter expects a plain 0-1 fraction. Asymmetric
-      // on purpose in the library itself — do not multiply by 100 here.
+      // on purpose in the library itself â do not multiply by 100 here.
       try { this.shifter.percentagePlayed = clamped; } catch (e) { /* ignore */ }
     }
 
@@ -1105,6 +1105,20 @@ export { AbstractFifoSamplePipe, PitchShifter, RateTransposer, SimpleFilter, Sou
       if (wasPlaying) this.play();
     }
 
+    // Like seek(), but always starts playback from the new position â
+    // used for scrubber clicks, where clicking the timeline should play
+    // from that point whether or not the player was already playing.
+    scrubTo(songPos) {
+      if (this._isPlaying) {
+        this._tracks.forEach(t => t.pitch && t.pitch.disconnectOut());
+        this._isPlaying = false;
+      }
+      this._pausedAt = Math.max(0, Math.min(this._duration, songPos));
+      this._updateTimeDisplay(this._pausedAt);
+      this._drawAllWaveforms();
+      this.play();
+    }
+
     _runProgressLoop() {
       const step = () => {
         if (!this._isPlaying) return;
@@ -1259,7 +1273,7 @@ export { AbstractFifoSamplePipe, PitchShifter, RateTransposer, SimpleFilter, Sou
       this._els.scrubber.addEventListener('click', (e) => {
         const rect = this._els.scrubber.getBoundingClientRect();
         const pct = (e.clientX - rect.left) / rect.width;
-        this.seek(pct * this._duration);
+        this.scrubTo(pct * this._duration);
       });
     }
 

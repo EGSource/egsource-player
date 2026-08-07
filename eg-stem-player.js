@@ -915,8 +915,11 @@ export { AbstractFifoSamplePipe, PitchShifter, RateTransposer, SimpleFilter, Sou
 
     seekFraction(frac) {
       if (!this.shifter) return;
-      const pct = Math.max(0, Math.min(100, frac * 100));
-      try { this.shifter.percentagePlayed = pct; } catch (e) { /* ignore */ }
+      const clamped = Math.max(0, Math.min(1, frac));
+      // NOTE: the underlying library's percentagePlayed getter returns
+      // 0-100, but its setter expects a plain 0-1 fraction. Asymmetric
+      // on purpose in the library itself — do not multiply by 100 here.
+      try { this.shifter.percentagePlayed = clamped; } catch (e) { /* ignore */ }
     }
 
     connectOut() {

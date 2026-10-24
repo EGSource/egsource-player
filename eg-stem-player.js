@@ -11,6 +11,17 @@
  *   </eg-stem-player>
  *
  * Tracks whose name contains "click" are never transposed.
+ *
+ * Added (EGSource site integration):
+ *   - Audio loads only once the player is actually on screen (or close to
+ *     it). A player inside a hidden section never downloads its tracks.
+ *     Add the attribute  eager  to load immediately like before.
+ *   - Opening the page with ?key=Ab in the address starts the player
+ *     transposed to that key. Add  ignore-url-key  to turn this off.
+ *   - Public methods: setMix({EG1:100, EG2:0, ...}) (0-100, clears
+ *     mute/solo), resetMix(), transposeToKey('Ab').
+ *   - Fires a "mixchange" event (detail.byUser = true) whenever a member
+ *     moves a fader or presses Solo/Mute.
  */
 // ======== Signalsmith Stretch (MIT) — bundled, unmodified except for
 // removal of its CommonJS/AMD auto-registration ========
@@ -661,15 +672,44 @@ return SignalsmithStretch;
       const keyAttr = this.getAttribute('key');
       if (keyAttr) this.setSongKey(keyAttr);
 
+      if (!this.hasAttribute('ignore-url-key')) {
+        try {
+          const urlKey = new URLSearchParams(window.location.search).get('key');
+          if (urlKey) this.transposeToKey(urlKey);
+        } catch (e) { /* ignore */ }
+      }
+
       const tracksAttr = this.getAttribute('tracks');
       if (tracksAttr) {
         try {
           const parsed = JSON.parse(tracksAttr);
-          this.loadTracks(parsed);
+          this._queueLoad(parsed);
         } catch (e) {
           console.error('eg-stem-player: invalid tracks attribute JSON', e);
         }
       }
+    }
+
+    disconnectedCallback() {
+      if (this._io) { this._io.disconnect(); this._io = null; }
+    }
+
+    // Loads the tracks once the player is on screen (or within ~1500px of
+    // it). A player inside a hidden section (display:none) never loads, so
+    // members who can't see PracticeMix don't download its audio.
+    _queueLoad(trackDefs) {
+      const go = () => {
+        if (this._loadStarted) return;
+        this._loadStarted = true;
+        if (this._io) { this._io.disconnect(); this._io = null; }
+        this.loadTracks(trackDefs);
+      };
+      if (this.hasAttribute('eager') || typeof IntersectionObserver === 'undefined') { go(); return; }
+      if (this._io) this._io.disconnect();
+      this._io = new IntersectionObserver((entries) => {
+        if (entries.some(e => e.isIntersecting)) go();
+      }, { rootMargin: '1500px 0px' });
+      this._io.observe(this);
     }
 
     _ensureCtx() {
@@ -837,6 +877,8 @@ return SignalsmithStretch;
         // play at their original pitch.
         const noTranspose = /click/i.test(def.name);
         const stem = new StemTrack(this._ctx, noTranspose ? this._clickBus : this._shiftBus);
+        const slider = this._tracks[i] && this._tracks[i].els && this._tracks[i].els.volSlider;
+        if (slider) stem.setVolume(parseFloat(slider.value));
         const buffer = await stem.load(def.src);
         this._tracks[i].noTranspose = noTranspose;
         this._tracks[i].stem = stem;
@@ -870,12 +912,57 @@ return SignalsmithStretch;
       this._els.transposeLabel.textContent = this._formatSemitones(n);
     }
 
+    // Transposes to a key by the shortest route (at most 6 half steps up
+    // or down). Needs the song's key attribute. Returns true if applied.
+    transposeToKey(keyName) {
+      const target = parseNoteName(keyName);
+      if (!target || this._songKeyIndex === null) return false;
+      let n = (((target.index - this._songKeyIndex) % 12) + 12) % 12;
+      if (n > 6) n -= 12;
+      this._targetUseFlats = target.useFlats;
+      this.setTransposeSemitones(n);
+      return !this._engineFailed;
+    }
+
+    // Sets track volumes by name, 0-100 (e.g. {EG1:100, EG2:0}). Clears
+    // every Solo, and un-mutes each track it sets.
+    setMix(levels) {
+      const want = {};
+      Object.keys(levels || {}).forEach(k => { want[String(k).toUpperCase()] = levels[k]; });
+      this._tracks.forEach(t => {
+        t.solo = false;
+        if (t.els) t.els.soloBtn.classList.remove('active');
+        const key = String(t.name).toUpperCase();
+        if (!(key in want)) return;
+        const v = Math.max(0, Math.min(100, Number(want[key]) || 0)) / 100;
+        t.mute = false;
+        if (t.els) {
+          t.els.muteBtn.classList.remove('active');
+          t.els.volSlider.value = v;
+        }
+        if (t.stem) t.stem.setVolume(v);
+      });
+      this._recomputeGates();
+      this._emitMixChange(false);
+    }
+
+    // Every track back to 100%, no Solo, no Mute.
+    resetMix() {
+      const all = {};
+      this._tracks.forEach(t => { all[String(t.name).toUpperCase()] = 100; });
+      this.setMix(all);
+    }
+
+    _emitMixChange(byUser) {
+      this.dispatchEvent(new CustomEvent('mixchange', { bubbles: true, composed: true, detail: { byUser: !!byUser } }));
+    }
+
     _formatSemitones(n) {
       if (this._songKeyIndex !== null) {
         const useFlats = this._songKeyUseFlats;
         const from = noteName(this._songKeyIndex, useFlats);
         if (n === 0) return `Original Key (${from})`;
-        const to = noteName(this._songKeyIndex + n, useFlats);
+        const to = noteName(this._songKeyIndex + n, typeof this._targetUseFlats === 'boolean' ? this._targetUseFlats : useFlats);
         const sign = n > 0 ? '+' : '';
         return `${from} \u2192 ${to} (${sign}${n})`;
       }
@@ -1272,9 +1359,11 @@ return SignalsmithStretch;
         this._onLoopSettingsChanged();
       });
       this._els.transposeUp.addEventListener('click', () => {
+        this._targetUseFlats = undefined;
         this.setTransposeSemitones(Math.min(6, this._semitones + 1));
       });
       this._els.transposeDown.addEventListener('click', () => {
+        this._targetUseFlats = undefined;
         this.setTransposeSemitones(Math.max(-6, this._semitones - 1));
       });
       this._attachScrubDrag(this._els.scrubber);
@@ -1376,18 +1465,21 @@ return SignalsmithStretch;
           t.solo = !t.solo;
           soloBtn.classList.toggle('active', t.solo);
           this._recomputeGates();
+          this._emitMixChange(true);
         });
         muteBtn.addEventListener('click', () => {
           const t = this._tracks[i];
           t.mute = !t.mute;
           muteBtn.classList.toggle('active', t.mute);
           this._recomputeGates();
+          this._emitMixChange(true);
         });
         volSlider.addEventListener('input', () => {
           const t = this._tracks[i];
           const v = parseFloat(volSlider.value);
           if (t.stem) t.stem.setVolume(v);
           this._drawAllWaveforms();
+          this._emitMixChange(true);
         });
       });
     }

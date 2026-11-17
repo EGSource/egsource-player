@@ -403,7 +403,7 @@ document.querySelector('.eg-orig-key').textContent=C.k;
 var ks=document.querySelector('.eg-key');
 AK.forEach(function(k){var o=document.createElement('option');o.value=k;o.textContent=k;if(k===C.k)o.selected=true;ks.appendChild(o);});
 var cs2=document.querySelector('.eg-user-capo');
-for(var ci=0;ci<=7;ci++){var co=document.createElement('option');co.value=ci;co.textContent=ci===0?'No Capo':'Capo '+ci;cs2.appendChild(co);}
+var maxCap=Math.max(7,C.C1||0,C.C2||0);for(var ci=0;ci<=maxCap;ci++){var co=document.createElement('option');co.value=ci;co.textContent=ci===0?'No Capo':'Capo '+ci;cs2.appendChild(co);}
 function uDC(){var part=document.querySelector('.eg-part').value;cs2.value=part==='EG1'?C.C1:C.C2;}
 uDC();
 document.querySelector('.eg-part').addEventListener('change',function(){uDC();render();});

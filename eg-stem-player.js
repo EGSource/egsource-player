@@ -568,8 +568,37 @@ return SignalsmithStretch;
     // onProgress(received, total) during download; onProgress(-1) while
     // the audio is being prepared after it arrives.
     async load(src, onProgress) {
-      const res = await fetch(src);
-      if (!res.ok) throw new Error('Could not load ' + src + ' (' + res.status + ')');
+      // The audio server occasionally answers "not found" or drops a
+      // download for a file that's really there; retry before giving up.
+      let arr, total = 0, lastErr = null;
+      for (let attempt = 0; attempt < 3; attempt++) {
+        if (attempt) {
+          if (onProgress) onProgress('retry', attempt);
+          await new Promise(r => setTimeout(r, 700 * attempt));
+        }
+        try {
+          ({ arr, total } = await this._download(src, onProgress));
+          lastErr = null;
+          break;
+        } catch (err) {
+          lastErr = err;
+          if (err && err.status === 403) break; // not allowed on this site; retrying won't help
+        }
+      }
+      if (lastErr) throw lastErr;
+      if (onProgress) onProgress(-1, total);
+      this.buffer = await this.ctx.decodeAudioData(arr);
+      this.duration = this.buffer.duration;
+      return this.buffer;
+    }
+
+    async _download(src, onProgress) {
+      const res = await fetch(src, { cache: 'no-cache' });
+      if (!res.ok) {
+        const e = new Error('Could not load ' + src + ' (' + res.status + ')');
+        e.status = res.status;
+        throw e;
+      }
       const total = Number(res.headers.get('content-length')) || 0;
       let arr;
       if (onProgress && res.body && res.body.getReader) {
@@ -590,10 +619,7 @@ return SignalsmithStretch;
       } else {
         arr = await res.arrayBuffer();
       }
-      if (onProgress) onProgress(-1, total);
-      this.buffer = await this.ctx.decodeAudioData(arr);
-      this.duration = this.buffer.duration;
-      return this.buffer;
+      return { arr, total };
     }
 
     setVolume(v) {
@@ -1034,6 +1060,11 @@ return SignalsmithStretch;
         box.classList.add('error');
         fill.style.width = '0%';
         text.textContent = 'Couldn\u2019t load this track';
+        return;
+      }
+      if (got === 'retry') {
+        fill.style.width = '0%';
+        text.textContent = 'Retrying\u2026';
         return;
       }
       if (got === -1) {

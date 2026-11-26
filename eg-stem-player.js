@@ -28,7 +28,7 @@
  *   - Fires a "mixchange" event (detail.byUser = true) whenever a member
  *     moves a fader or presses Solo/Mute.
  */
-// ======== Signalsmith Stretch (MIT) — bundled, unmodified except for
+// ======== Signalsmith Stretch (MIT) \u2014 bundled, unmodified except for
 // removal of its CommonJS/AMD auto-registration ========
 var __EGSourceStretch = (function () {
 
@@ -565,10 +565,32 @@ return SignalsmithStretch;
       this.muted = false;
     }
 
-    async load(src) {
+    // onProgress(received, total) during download; onProgress(-1) while
+    // the audio is being prepared after it arrives.
+    async load(src, onProgress) {
       const res = await fetch(src);
       if (!res.ok) throw new Error('Could not load ' + src + ' (' + res.status + ')');
-      const arr = await res.arrayBuffer();
+      const total = Number(res.headers.get('content-length')) || 0;
+      let arr;
+      if (onProgress && res.body && res.body.getReader) {
+        const reader = res.body.getReader();
+        const chunks = [];
+        let got = 0;
+        for (;;) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          chunks.push(value);
+          got += value.length;
+          onProgress(got, total);
+        }
+        const all = new Uint8Array(got);
+        let o = 0;
+        chunks.forEach(c => { all.set(c, o); o += c.length; });
+        arr = all.buffer;
+      } else {
+        arr = await res.arrayBuffer();
+      }
+      if (onProgress) onProgress(-1, total);
       this.buffer = await this.ctx.decodeAudioData(arr);
       this.duration = this.buffer.duration;
       return this.buffer;
@@ -794,7 +816,7 @@ return SignalsmithStretch;
         this._clickWetGain.connect(this._outGain);
 
         // iOS can suspend audio mid-playback (volume buttons, interruptions)
-        // without the page calling pause() — self-heal if that happens.
+        // without the page calling pause() \u2014 self-heal if that happens.
         ctx.addEventListener('statechange', () => {
           if (this._isPlaying && ctx.state === 'suspended') ctx.resume().catch(() => {});
         });
@@ -850,7 +872,7 @@ return SignalsmithStretch;
         node.connect(this._clickWetGain);
         this._clickStretch = node;
       })().catch((err) => {
-        console.warn('EGSource PracticeMix: click pitch correction unavailable —', err);
+        console.warn('EGSource PracticeMix: click pitch correction unavailable \u2014', err);
         this._clickEnginePromise = null;
       });
       const limit = new Promise(resolve => setTimeout(resolve, 8000));
@@ -877,7 +899,7 @@ return SignalsmithStretch;
 
     _engineInitFailed(err, allowRetry, stillLoading) {
       if (this._stretch) return;
-      console.warn('EGSource PracticeMix: transpose unavailable —', err);
+      console.warn('EGSource PracticeMix: transpose unavailable \u2014', err);
       this._engineError = (err && err.message) ? err.message : String(err);
       this._engineFailed = true;
       this._disableTranspose(stillLoading);
@@ -958,6 +980,7 @@ return SignalsmithStretch;
       if (this._els && this._els.cueLayer) this._els.cueLayer.innerHTML = '';
       this._buildTrackRows(trackDefs.map(t => t.name));
 
+      this._setLoading(true);
       const loads = trackDefs.map(async (def, i) => {
         // Tracks named "CLICK" skip the pitch engine entirely and always
         // play at their original pitch.
@@ -965,7 +988,15 @@ return SignalsmithStretch;
         const stem = new StemTrack(this._ctx, noTranspose ? this._clickBus : this._shiftBus);
         const slider = this._tracks[i] && this._tracks[i].els && this._tracks[i].els.volSlider;
         if (slider) stem.setVolume(parseFloat(slider.value));
-        const buffer = await stem.load(def.src);
+        let buffer;
+        try {
+          buffer = await stem.load(def.src, (got, total) => this._setTrackLoad(i, got, total));
+        } catch (err) {
+          console.warn('EGSource PracticeMix: could not load ' + def.name, err);
+          this._setTrackLoad(i, 'error');
+          return;
+        }
+        this._setTrackLoad(i, 'done');
         this._tracks[i].noTranspose = noTranspose;
         this._tracks[i].stem = stem;
         this._tracks[i].buffer = buffer;
@@ -974,10 +1005,49 @@ return SignalsmithStretch;
       });
 
       await Promise.all(loads);
+      this._setLoading(false);
+      if (!this._duration) throw new Error('No tracks could be loaded');
       this._detectCues();
       this._recomputeGates();
       this._updateTimeDisplay(0);
       this._els.total.textContent = this._formatTime(this._duration);
+    }
+
+    // ---- Loading progress ---------------------------------------------
+    _setLoading(on) {
+      this._loading = on;
+      if (!this._els) return;
+      this._els.playBtn.classList.toggle('is-loading', on);
+      this._els.playBtn.title = on ? 'Loading tracks\u2026' : '';
+      this._els.playBtn.setAttribute('aria-label', on ? 'Loading tracks' : 'Play');
+    }
+
+    _setTrackLoad(i, got, total) {
+      const t = this._tracks[i];
+      const box = t && t.els && t.els.loadState;
+      if (!box) return;
+      const fill = box.querySelector('.load-fill');
+      const text = box.querySelector('.load-text');
+      if (got === 'done') { box.classList.add('hidden'); return; }
+      box.classList.remove('hidden');
+      if (got === 'error') {
+        box.classList.add('error');
+        fill.style.width = '0%';
+        text.textContent = 'Couldn\u2019t load this track';
+        return;
+      }
+      if (got === -1) {
+        fill.style.width = '100%';
+        text.textContent = 'Preparing\u2026';
+        return;
+      }
+      if (total) {
+        const pct = Math.min(100, Math.round(got / total * 100));
+        fill.style.width = pct + '%';
+        text.textContent = 'Loading\u2026 ' + pct + '%';
+      } else {
+        text.textContent = 'Loading\u2026 ' + (got / 1048576).toFixed(1) + ' MB';
+      }
     }
 
     // ---- Song key / transpose display -------------------------------
@@ -1287,7 +1357,7 @@ return SignalsmithStretch;
       this._loopTimer = setTimeout(() => {
         if (token !== this._loopToken || !this._isPlaying) return;
         if (spliceAt < this._ctx.currentTime + 0.03) {
-          // Timer ran late (e.g. background tab) — restart cleanly instead.
+          // Timer ran late (e.g. background tab) \u2014 restart cleanly instead.
           this._startSourcesAt(start);
           return;
         }
@@ -1303,7 +1373,7 @@ return SignalsmithStretch;
       if (!this._isPlaying) return;
       const now = this._ctx.currentTime;
       if (this._hasFutureSegment(now)) {
-        // A loop jump is already queued — re-sync from the current spot.
+        // A loop jump is already queued \u2014 re-sync from the current spot.
         this._startSourcesAt(this._songPositionAt(now));
       } else {
         this._loopToken++;
@@ -1653,6 +1723,16 @@ return SignalsmithStretch;
         .no-transpose-tag { display:block; font-family:'Manrope',sans-serif; font-size:9px; font-weight:400; color:${COLORS.subtext}; letter-spacing:0.2px; margin-top:2px; }
         .waveform-wrap { flex:1; height:44px; position:relative; }
         .waveform-wrap:hover { outline: 1px solid #3a3a3a; }
+        .load-state {
+          position:absolute; inset:0; display:flex; flex-direction:column; align-items:center; justify-content:center; gap:6px;
+          background:#000; pointer-events:none; transition:opacity .3s ease;
+        }
+        .load-state.hidden { opacity:0; visibility:hidden; }
+        .load-bar { width:min(220px, 60%); height:2px; background:#2a2a2a; border-radius:2px; overflow:hidden; }
+        .load-fill { width:0%; height:100%; background:${COLORS.accent}; box-shadow:0 0 6px rgba(34,255,222,0.6); transition:width .2s linear; }
+        .load-text { font-size:11px; color:${COLORS.subtext}; font-variant-numeric:tabular-nums; letter-spacing:0.2px; }
+        .load-state.error .load-text { color:#e85b5b; }
+        .icon-btn.is-loading { opacity:0.35; cursor:progress; }
         .waveform-loop-region { position:absolute; top:0; height:100%; background:rgba(34,255,222,0.18); border-left:2px solid ${COLORS.accent}; border-right:2px solid ${COLORS.accent}; display:none; pointer-events:none; }
         canvas { width:100%; height:100%; display:block; touch-action:pan-y; }
         .scrubber { touch-action:pan-y; }
@@ -1853,6 +1933,10 @@ return SignalsmithStretch;
           <div class="waveform-wrap">
             <canvas data-role="canvas"></canvas>
             <div class="waveform-loop-region" data-role="waveformLoopRegion"></div>
+            <div class="load-state" data-role="loadState" aria-live="polite">
+              <div class="load-bar"><div class="load-fill"></div></div>
+              <span class="load-text">Waiting\u2026</span>
+            </div>
           </div>
         `;
         this._els.tracksWrap.appendChild(row);
@@ -1862,10 +1946,11 @@ return SignalsmithStretch;
         const volSlider = row.querySelector('[data-role="vol"]');
         const canvas = row.querySelector('canvas');
         const loopRegionEl = row.querySelector('[data-role="waveformLoopRegion"]');
+        const loadState = row.querySelector('[data-role="loadState"]');
         canvas.style.cursor = 'pointer';
         this._attachScrubDrag(canvas);
 
-        this._tracks[i].els = { row, soloBtn, muteBtn, volSlider, canvas, loopRegionEl };
+        this._tracks[i].els = { row, soloBtn, muteBtn, volSlider, canvas, loopRegionEl, loadState };
 
         soloBtn.addEventListener('click', () => {
           const t = this._tracks[i];

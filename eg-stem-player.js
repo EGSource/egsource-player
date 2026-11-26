@@ -1657,8 +1657,8 @@ return SignalsmithStretch;
           :host([show-title]) .transpose { order:6; }
           :host([show-title]) .speed-wrap { order:7; margin-left:auto; }
         }
-        .icon-btn { background:none; border:none; color:${COLORS.text}; cursor:pointer; display:flex; padding:4px; opacity:0.9; }
-        .icon-btn:hover { opacity:1; }
+        .icon-btn { background:none; border:none; color:#e6e6e6; cursor:pointer; display:flex; padding:4px; }
+        .icon-btn:hover { color:#ffffff; }
         .icon-btn.active { color:${COLORS.accent}; }
         .mix-btn {
           background:#2c2c2c; border:1px solid #444; color:${COLORS.subtext};
@@ -1718,14 +1718,26 @@ return SignalsmithStretch;
         }
         .speed-select.changed { color:${COLORS.accent}; border-color:${COLORS.accent}; }
         /* ---- Hover, press and glow feedback ---- */
-        .icon-btn, .transpose-btn, .speed-select, .mix-btn, .loop-clear-btn {
-          transition: color .15s ease, background-color .15s ease, border-color .15s ease, box-shadow .2s ease, filter .2s ease, transform .1s ease, opacity .15s ease;
+        .transpose-btn, .speed-select, .mix-btn {
+          transition: color .15s ease, background-color .15s ease, border-color .15s ease, box-shadow .2s ease, transform .1s ease, opacity .15s ease;
         }
+        /* Play / loop / clear: the glow is a separate layer behind the icon
+           that fades in, so the icon itself is never re-drawn (no jitter). */
+        .icon-btn, .loop-clear-btn { position:relative; isolation:isolate; transition: color .15s ease; }
+        .icon-btn > svg { position:relative; z-index:1; }
+        /* Only colors and soft shadows fade here (no opacity, filter or
+           transform animation), so the browser never moves the icons onto a
+           separate graphics layer mid-hover, which is what made them jiggle. */
+        .icon-btn::before, .loop-clear-btn::before {
+          content:''; position:absolute; left:50%; top:50%; width:28px; height:28px; margin:-14px 0 0 -14px; border-radius:50%;
+          background-color: rgba(255,255,255,0); box-shadow: 0 0 10px 3px rgba(255,255,255,0);
+          transition: background-color .2s ease, box-shadow .2s ease; pointer-events:none; z-index:0;
+        }
+        .icon-btn.active::before { background-color: rgba(34,255,222,0.08); box-shadow: 0 0 10px 3px rgba(34,255,222,0.18); }
         .transpose-label { transition: color .2s ease, text-shadow .2s ease; }
         @media (hover: hover) {
-          .icon-btn:hover { filter: drop-shadow(0 0 5px rgba(255,255,255,0.35)); }
-          .icon-btn.active:hover { filter: drop-shadow(0 0 7px rgba(34,255,222,0.75)); }
-          .loop-clear-btn:hover { filter: drop-shadow(0 0 5px rgba(255,255,255,0.35)); }
+          .icon-btn:hover::before, .loop-clear-btn:hover::before { background-color: rgba(255,255,255,0.07); box-shadow: 0 0 10px 3px rgba(255,255,255,0.10); }
+          .icon-btn.active:hover::before { background-color: rgba(34,255,222,0.12); box-shadow: 0 0 12px 4px rgba(34,255,222,0.28); }
           .transpose-btn:not(:disabled):hover, .speed-wrap:not(.disabled):hover .speed-select, .mix-btn:hover {
             border-color: rgba(34,255,222,0.55); box-shadow: 0 0 8px rgba(34,255,222,0.22); transform: translateY(-1px);
           }
@@ -1733,9 +1745,9 @@ return SignalsmithStretch;
           .mix-btn.mute-btn:hover { border-color: rgba(232,91,91,0.65); box-shadow: 0 0 8px rgba(232,91,91,0.35); }
           [data-role="keyWrap"]:hover .transpose-label { text-decoration:underline dotted rgba(196,196,196,0.6); text-underline-offset:4px; }
         }
-        .icon-btn:active, .transpose-btn:not(:disabled):active, .mix-btn:active, .loop-clear-btn:active { transform: scale(0.92); }
+        .transpose-btn:not(:disabled):active, .mix-btn:active { transform: scale(0.92); }
+        .icon-btn:active::before, .loop-clear-btn:active::before { background-color: rgba(255,255,255,0.14); }
         /* Selected states glow */
-        .icon-btn.active { filter: drop-shadow(0 0 5px rgba(34,255,222,0.6)); }
         .mix-btn.solo-btn.active { box-shadow: 0 0 10px rgba(34,255,222,0.55); }
         .mix-btn.mute-btn.active { box-shadow: 0 0 10px rgba(232,91,91,0.55); }
         .speed-select.changed { box-shadow: 0 0 8px rgba(34,255,222,0.35); }
@@ -1743,7 +1755,7 @@ return SignalsmithStretch;
           outline: 2px solid rgba(34,255,222,0.7); outline-offset: 2px;
         }
         @media (prefers-reduced-motion: reduce) {
-          .icon-btn, .transpose-btn, .speed-select, .mix-btn, .loop-clear-btn, .transpose-label { transition: none; }
+          .icon-btn, .transpose-btn, .speed-select, .mix-btn, .loop-clear-btn, .transpose-label, .icon-btn::before, .loop-clear-btn::before { transition: none; }
           .icon-btn:active, .transpose-btn:active, .mix-btn:active, .loop-clear-btn:active, .transpose-btn:hover, .speed-wrap:hover .speed-select, .mix-btn:hover { transform: none; }
         }
         .tracks { background:#000; }

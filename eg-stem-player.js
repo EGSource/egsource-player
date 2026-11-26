@@ -11,6 +11,11 @@
  *   </eg-stem-player>
  *
  * Tracks whose name contains "click" are never transposed.
+ * Spoken cues in the CLICK track show as tappable dots on the playhead
+ * (add no-cues to the tag to hide them).
+ * The title is hidden by default (the song page already shows it); add
+ * show-title to the tag to display it, e.g. on a page with several players.
+ * Speed control (0.25x / 0.5x / 0.75x / 1x) changes tempo without changing pitch.
  *
  * Added (EGSource site integration):
  *   - Audio loads only once the player is actually on screen (or close to
@@ -517,6 +522,10 @@ return SignalsmithStretch;
     accent: '#22ffde'
   };
 
+  const SPEED_MIN = 0.25;
+  const SPEED_MAX = 1;
+  const SPEED_PRESETS = [0.25, 0.5, 0.75, 1];
+
   // ---- Note name helpers for key-aware transpose display ---------------
   const SHARP_NAMES = ['C', 'C#', 'D', 'D#', 'E', 'F', 'F#', 'G', 'G#', 'A', 'A#', 'B'];
   const FLAT_NAMES = ['C', 'Db', 'D', 'Eb', 'E', 'F', 'Gb', 'G', 'Ab', 'A', 'Bb', 'B'];
@@ -578,12 +587,13 @@ return SignalsmithStretch;
     // Schedules playback of this stem from `offset` seconds, starting at
     // audio-clock time `when`. Whatever was playing hands off at exactly
     // that moment (sample-accurate), which is how loops stay seamless.
-    start(when, offset) {
+    start(when, offset, rate) {
       if (this.current) this._stopSource(this.current, when);
       this.current = null;
       if (!this.buffer || offset >= this.buffer.duration) return;
       const s = this.ctx.createBufferSource();
       s.buffer = this.buffer;
+      s.playbackRate.value = rate || 1;
       s.connect(this.trackGain);
       s.onended = () => {
         this.sources.delete(s);
@@ -661,6 +671,14 @@ return SignalsmithStretch;
       this._loopToken = 0;
       this._starting = false;
       this._cancelStart = false;
+
+      // Speed (1 = normal). _rate is what the member picked; _srcRate is
+      // the speed of the audio currently scheduled.
+      this._rate = 1;
+      this._srcRate = 1;
+      this._speedToken = 0;
+      this._clickStretch = null;   // pitch-corrects CLICK when slowed
+      this._clickEnginePromise = null;
     }
 
     connectedCallback() {
@@ -677,6 +695,21 @@ return SignalsmithStretch;
           const urlKey = new URLSearchParams(window.location.search).get('key');
           if (urlKey) this.transposeToKey(urlKey);
         } catch (e) { /* ignore */ }
+      }
+
+      if (typeof ResizeObserver !== 'undefined' && !this._resizeObs) {
+        let lastW = 0, timer = null;
+        this._resizeObs = new ResizeObserver(entries => {
+          const w = Math.round(entries[0].contentRect.width);
+          if (!w || w === lastW) return;
+          lastW = w;
+          clearTimeout(timer);
+          timer = setTimeout(() => {
+            this._tracks.forEach((t, i) => { if (t.buffer) this._drawWaveform(i); });
+            this._drawAllWaveforms();
+          }, 150);
+        });
+        this._resizeObs.observe(this._els.tracksWrap);
       }
 
       const tracksAttr = this.getAttribute('tracks');
@@ -726,10 +759,13 @@ return SignalsmithStretch;
         // Signal flow:
         //   transposable stems -> shiftBus -> [pitch engine] -> wetGain -\
         //                         shiftBus -> dryDelay ------> dryGain ---> outGain -> speakers
-        //   CLICK stem --------> clickBus -> clickDelay ----------------/
-        // The dry and click paths are delayed by exactly the pitch
-        // engine's latency, so everything stays in sync. At Original Key
-        // the dry path is used, so the audio is completely untouched.
+        //   CLICK stem --------> clickBus -> clickDelay -> clickDryGain -/
+        //                         clickBus -> [click engine] -> clickWetGain -/
+        // Speed works by playing stems faster/slower and having the pitch
+        // engine correct the pitch back. CLICK only gets its own engine
+        // when speed isn't 100% (so cues keep their pitch). Dry paths are
+        // delayed by the engine's latency so everything stays in sync. At
+        // Original Key and 100% speed the audio is completely untouched.
         this._outGain = ctx.createGain();
         this._outGain.gain.value = 0;
         this._outGain.connect(ctx.destination);
@@ -749,7 +785,13 @@ return SignalsmithStretch;
         this._dryGain.connect(this._outGain);
         this._wetGain.connect(this._outGain);
         this._clickBus.connect(this._clickDelay);
-        this._clickDelay.connect(this._outGain);
+        this._clickDryGain = ctx.createGain();
+        this._clickDryGain.gain.value = 1;
+        this._clickWetGain = ctx.createGain();
+        this._clickWetGain.gain.value = 0;
+        this._clickDelay.connect(this._clickDryGain);
+        this._clickDryGain.connect(this._outGain);
+        this._clickWetGain.connect(this._outGain);
 
         // iOS can suspend audio mid-playback (volume buttons, interruptions)
         // without the page calling pause() — self-heal if that happens.
@@ -796,6 +838,26 @@ return SignalsmithStretch;
       return this._enginePromise;
     }
 
+    // A second engine instance that keeps CLICK at its original pitch when
+    // the speed isn't 100%. Created the first time speed is changed.
+    _ensureClickEngine() {
+      if (this._clickStretch || !this._stretch) return Promise.resolve();
+      if (this._clickEnginePromise) return this._clickEnginePromise;
+      const make = (async () => {
+        const node = await __EGSourceStretch(this._ctx);
+        await node.schedule({ active: true, semitones: 0 });
+        this._clickBus.connect(node);
+        node.connect(this._clickWetGain);
+        this._clickStretch = node;
+      })().catch((err) => {
+        console.warn('EGSource PracticeMix: click pitch correction unavailable —', err);
+        this._clickEnginePromise = null;
+      });
+      const limit = new Promise(resolve => setTimeout(resolve, 8000));
+      this._clickEnginePromise = Promise.race([make, limit]);
+      return this._clickEnginePromise;
+    }
+
     _installEngine(node, lat) {
       if (this._stretch) return;
       this._shiftBus.connect(node);
@@ -824,37 +886,59 @@ return SignalsmithStretch;
       if (allowRetry && !stillLoading) this._enginePromise = null;
     }
 
-    _applyPitchRouting(instant) {
+    _applyPitchRouting(instant, atTime) {
       if (!this._ctx) return;
-      const useWet = !!this._stretch && this._semitones !== 0;
+      // Playing faster raises pitch and slower lowers it, so the engine
+      // shifts it back by the same amount on top of the chosen transpose.
+      const rate = this._isPlaying ? this._srcRate : this._rate;
+      const speedShift = rate === 1 ? 0 : -12 * Math.log2(rate);
+      const eff = this._semitones + speedShift;
+      const useWet = !!this._stretch && Math.abs(eff) > 1e-6;
+      const useClickWet = !!this._clickStretch && Math.abs(speedShift) > 1e-6;
       if (this._stretch) {
-        try { this._stretch.schedule({ active: true, semitones: this._semitones }); } catch (e) { /* ignore */ }
+        try { this._stretch.schedule({ active: true, semitones: eff }); } catch (e) { /* ignore */ }
+      }
+      if (this._clickStretch) {
+        try { this._clickStretch.schedule({ active: true, semitones: speedShift }); } catch (e) { /* ignore */ }
       }
       const now = this._ctx.currentTime;
+      const at = Math.max(now, atTime || now);
       const tc = instant ? 0.001 : 0.015;
-      this._wetGain.gain.cancelScheduledValues(now);
-      this._dryGain.gain.cancelScheduledValues(now);
-      this._wetGain.gain.setTargetAtTime(useWet ? 1 : 0, now, tc);
-      this._dryGain.gain.setTargetAtTime(useWet ? 0 : 1, now, tc);
+      [[this._wetGain, useWet ? 1 : 0], [this._dryGain, useWet ? 0 : 1],
+       [this._clickWetGain, useClickWet ? 1 : 0], [this._clickDryGain, useClickWet ? 0 : 1]].forEach(([node, v]) => {
+        node.gain.cancelScheduledValues(now);
+        node.gain.setTargetAtTime(v, at, tc);
+      });
     }
 
     _disableTranspose(stillLoading) {
       if (!this._els) return;
       this._semitones = 0;
+      this._rate = 1;
+      this._els.speedSelect.disabled = true;
+      if (this._els.speedWrap) this._els.speedWrap.classList.add('disabled');
+      this._updateSpeedLabel();
       this._els.transposeUp.disabled = true;
       this._els.transposeDown.disabled = true;
       this._els.transposeUp.style.opacity = '0.35';
       this._els.transposeDown.style.opacity = '0.35';
-      this._els.transposeLabel.textContent = stillLoading ? 'Transpose loading\u2026' : 'Transpose unavailable';
+      this._els.transposeLabel.textContent = stillLoading ? 'Key \u2026' : 'Key \u2013';
+      if (this._els.keySelect) { this._els.keySelect.disabled = true; this._els.keySelect.value = '0'; }
+      this._els.transposeLabel.classList.remove('changed');
+      this._els.transposeLabel.title = stillLoading ? 'Transpose loading' : 'Transpose unavailable';
     }
 
     _enableTranspose() {
       if (!this._els) return;
+      this._els.speedSelect.disabled = false;
+      if (this._els.keySelect) this._els.keySelect.disabled = false;
+      if (this._els.speedWrap) this._els.speedWrap.classList.remove('disabled');
+      this._updateSpeedLabel();
       this._els.transposeUp.disabled = false;
       this._els.transposeDown.disabled = false;
       this._els.transposeUp.style.opacity = '';
       this._els.transposeDown.style.opacity = '';
-      this._els.transposeLabel.textContent = this._formatSemitones(this._semitones);
+      this._renderKeyLabel(this._semitones);
     }
 
     async loadTracks(trackDefs) {
@@ -870,6 +954,8 @@ return SignalsmithStretch;
       this._duration = 0;
       this._pausedAt = 0;
       this.clearLoopRegion();
+      this._cues = [];
+      if (this._els && this._els.cueLayer) this._els.cueLayer.innerHTML = '';
       this._buildTrackRows(trackDefs.map(t => t.name));
 
       const loads = trackDefs.map(async (def, i) => {
@@ -888,6 +974,7 @@ return SignalsmithStretch;
       });
 
       await Promise.all(loads);
+      this._detectCues();
       this._recomputeGates();
       this._updateTimeDisplay(0);
       this._els.total.textContent = this._formatTime(this._duration);
@@ -898,18 +985,147 @@ return SignalsmithStretch;
       this._setTitle(title);
     }
 
+    // ---- Section cue dots -------------------------------------------
+    // Finds the spoken cues ("Verse", "Chorus"...) in the CLICK track and
+    // puts a dot on the playhead at each one. Clicks are short blips;
+    // spoken words are longer bursts, so short blips are filtered out and
+    // what's left are the words. A cue word plus its count words make one
+    // dot. Add the attribute  no-cues  to turn the dots off.
+    _detectCues() {
+      this._cues = [];
+      if (this._els.cueLayer) this._els.cueLayer.innerHTML = '';
+      if (this.hasAttribute('no-cues')) return;
+      const t = this._tracks.find(tr => tr.noTranspose && tr.buffer);
+      if (!t) return;
+      try {
+        const buf = t.buffer, sr = buf.sampleRate;
+        const chans = [];
+        for (let c = 0; c < buf.numberOfChannels; c++) chans.push(buf.getChannelData(c));
+        const hop = Math.round(sr * 0.01);            // 10 ms frames
+        const n = Math.floor(buf.length / hop);
+        const rms = new Float32Array(n);
+        for (let f = 0; f < n; f++) {
+          let s = 0;
+          const a = f * hop;
+          for (let c = 0; c < chans.length; c++) {
+            const d = chans[c];
+            for (let k = a; k < a + hop; k++) s += d[k] * d[k];
+          }
+          rms[f] = Math.sqrt(s / (hop * chans.length));
+        }
+        // Remove anything shorter than ~120 ms (the clicks): min then max filter
+        const w = 12, half = w >> 1;
+        const filt = (src, useMin) => {
+          const out = new Float32Array(n);
+          for (let i = 0; i < n; i++) {
+            let v = src[i];
+            for (let k = Math.max(0, i - half); k < Math.min(n, i + half); k++) v = useMin ? Math.min(v, src[k]) : Math.max(v, src[k]);
+            out[i] = v;
+          }
+          return out;
+        };
+        const sustained = filt(filt(rms, true), false);
+        const thresh = Math.pow(10, -45 / 20);
+        let onFrames = 0;
+        const words = [];
+        for (let i = 0; i < n; i++) {
+          if (sustained[i] > thresh) {
+            onFrames++;
+            let j = i; while (j < n && sustained[j] > thresh) { j++; onFrames++; }
+            words.push([i * 0.01, j * 0.01]);
+            i = j;
+          }
+        }
+        // A track that's mostly continuous sound isn't a clean cue track
+        if (!words.length || onFrames / n > 0.25) return;
+        const groups = [];
+        words.forEach(([a, b]) => {
+          const last = groups[groups.length - 1];
+          if (last && a - last[1] < 2.0) last[1] = b; else groups.push([a, b]);
+        });
+        let cues = groups.map(g => g[0]).filter(s => s >= 1.0 && s < this._duration - 0.5);
+        if (cues.length > 40) return; // too many to be section cues
+        this._cues = cues;
+        this._renderCueDots();
+      } catch (e) {
+        console.warn('EGSource PracticeMix: cue detection skipped', e);
+      }
+    }
+
+    _renderCueDots() {
+      const layer = this._els.cueLayer;
+      if (!layer || !this._duration) return;
+      layer.innerHTML = '';
+      this._cues.forEach(sec => {
+        const dot = document.createElement('button');
+        dot.className = 'cue-dot';
+        dot.style.left = (sec / this._duration * 100) + '%';
+        dot.title = 'Jump to the cue at ' + this._formatTime(sec);
+        dot.setAttribute('aria-label', 'Jump to the cue at ' + this._formatTime(sec));
+        dot.dataset.sec = String(sec);
+        // Mouse/touch taps are handled by the bar's own drag logic (so a
+        // drag that starts on a dot still makes a loop). This handles the
+        // keyboard (Enter/Space), which sends a click with detail 0.
+        dot.addEventListener('click', e => { if (e.detail === 0) this.scrubTo(sec); });
+        layer.appendChild(dot);
+      });
+    }
+
+    // Key label: original key in light gray, new key in teal. The arrow
+    // points right when going up and left when going down ("C \u2190 Db").
+    _renderKeyLabel(n) {
+      const lbl = this._els && this._els.transposeLabel;
+      if (!lbl) return;
+      this._formatSemitones(n); // keeps the tooltip up to date
+      lbl.classList.remove('changed');
+      const span = (cls, txt) => '<span class="' + cls + '">' + txt + '</span>';
+      const arrow = (up) => span('k-arrow', up ? '\u2192' : '\u2190');
+      if (this._songKeyIndex !== null) {
+        const useFlats = this._songKeyUseFlats;
+        const from = noteName(this._songKeyIndex, useFlats);
+        const to = noteName(this._songKeyIndex + n, typeof this._targetUseFlats === 'boolean' ? this._targetUseFlats : useFlats);
+        if (n === 0) lbl.innerHTML = span('k-from', 'Key: ' + from);
+        else if (n > 0) lbl.innerHTML = span('k-from', from) + arrow(true) + span('k-to', to);
+        else lbl.innerHTML = span('k-to', to) + arrow(false) + span('k-from', from);
+      } else {
+        lbl.innerHTML = n === 0 ? span('k-from', 'Key')
+          : span('k-to', (n > 0 ? '+' : '\u2212') + Math.abs(n));
+      }
+      if (this._els.keySelect) this._els.keySelect.value = String(n);
+    }
+
+    // Key dropdown: higher keys above the original, lower keys below it.
+    _buildKeyOptions() {
+      const sel = this._els && this._els.keySelect;
+      if (!sel) return;
+      let html = '';
+      for (let n = 6; n >= -6; n--) {
+        const steps = n === 0 ? 'original' : (n > 0 ? '+' : '\u2212') + Math.abs(n);
+        let text;
+        if (this._songKeyIndex !== null) {
+          text = noteName(this._songKeyIndex + n, this._songKeyUseFlats) + '  (' + steps + ')';
+        } else {
+          text = n === 0 ? 'Original' : steps;
+        }
+        html += '<option value="' + n + '">' + text + '</option>';
+      }
+      sel.innerHTML = html;
+      sel.value = String(this._semitones);
+    }
+
     setSongKey(keyName) {
       const parsed = parseNoteName(keyName);
       this._songKeyIndex = parsed ? parsed.index : null;
       this._songKeyUseFlats = parsed ? parsed.useFlats : false;
-      this._els.transposeLabel.textContent = this._formatSemitones(this._semitones);
+      this._buildKeyOptions();
+      this._renderKeyLabel(this._semitones);
     }
 
     setTransposeSemitones(n) {
       if (this._engineFailed) return;
       this._semitones = n;
       this._applyPitchRouting(false);
-      this._els.transposeLabel.textContent = this._formatSemitones(n);
+      this._renderKeyLabel(n);
     }
 
     // Transposes to a key by the shortest route (at most 6 half steps up
@@ -957,17 +1173,47 @@ return SignalsmithStretch;
       this.dispatchEvent(new CustomEvent('mixchange', { bubbles: true, composed: true, detail: { byUser: !!byUser } }));
     }
 
+    // Speed: 0.5 (half speed) to 1.25, without changing pitch.
+    setSpeed(rate) {
+      if (this._engineFailed) return;
+      rate = Math.round(Math.max(SPEED_MIN, Math.min(SPEED_MAX, rate)) * 100) / 100;
+      if (rate === this._rate) return;
+      this._rate = rate;
+      this._updateSpeedLabel();
+      const token = ++this._speedToken;
+      const apply = () => {
+        if (token !== this._speedToken) return;
+        if (this._isPlaying) this._startSourcesAt(this._songPositionAt(this._ctx.currentTime));
+        else this._applyPitchRouting(true);
+      };
+      if (this._ctx && this._stretch && rate !== 1) this._ensureClickEngine().then(apply);
+      else apply();
+    }
+
+    _updateSpeedLabel() {
+      if (!this._els || !this._els.speedSelect) return;
+      this._els.speedSelect.value = String(this._rate);
+      if (this._els.speedDisplay) {
+        this._els.speedDisplay.textContent = this._rate + '\u00d7';
+        this._els.speedDisplay.classList.toggle('changed', this._rate !== 1);
+      }
+    }
+
     _formatSemitones(n) {
+      const lbl = this._els && this._els.transposeLabel;
+      if (lbl) {
+        lbl.classList.toggle('changed', n !== 0);
+        lbl.title = n === 0 ? 'Original key'
+          : (n > 0 ? '+' : '\u2212') + Math.abs(n) + ' semitone' + (Math.abs(n) === 1 ? '' : 's');
+      }
       if (this._songKeyIndex !== null) {
         const useFlats = this._songKeyUseFlats;
         const from = noteName(this._songKeyIndex, useFlats);
-        if (n === 0) return `Original Key (${from})`;
-        const to = noteName(this._songKeyIndex + n, typeof this._targetUseFlats === 'boolean' ? this._targetUseFlats : useFlats);
-        const sign = n > 0 ? '+' : '';
-        return `${from} \u2192 ${to} (${sign}${n})`;
+        if (n === 0) return `Key: ${from}`;
+        return `${from} \u2192 ${noteName(this._songKeyIndex + n, typeof this._targetUseFlats === 'boolean' ? this._targetUseFlats : useFlats)}`;
       }
-      if (n === 0) return 'Original Key';
-      return (n > 0 ? '+' : '') + n + ' semitone' + (Math.abs(n) === 1 ? '' : 's');
+      if (n === 0) return 'Key';
+      return (n > 0 ? '+' : '\u2212') + Math.abs(n);
     }
 
     // ---- Transport --------------------------------------------------
@@ -980,7 +1226,7 @@ return SignalsmithStretch;
       for (let i = 1; i < this._segments.length; i++) {
         if (this._segments[i].at <= ctxTime) seg = this._segments[i];
       }
-      return seg.pos + (ctxTime - seg.at);
+      return seg.pos + (ctxTime - seg.at) * (seg.rate || 1);
     }
 
     _hasFutureSegment(ctxTime) {
@@ -1008,10 +1254,13 @@ return SignalsmithStretch;
       g.setTargetAtTime(0, now, 0.005);
 
       const t0 = now + 0.04;
+      const rate = this._rate;
+      this._srcRate = rate;
+      this._applyPitchRouting(true, t0);
       this._tracks.forEach(t => {
         if (!t.stem) return;
         t.stem.stopAll(t0);
-        t.stem.start(t0, offset);
+        t.stem.start(t0, offset, rate);
       });
 
       g.setValueAtTime(0, t0 + L);
@@ -1019,7 +1268,7 @@ return SignalsmithStretch;
 
       this._srcStart = t0;
       this._srcOffset = offset;
-      this._segments = [{ at: t0 + L, pos: offset }];
+      this._segments = [{ at: t0 + L, pos: offset, rate }];
       this._scheduleLoopSplice();
     }
 
@@ -1031,7 +1280,8 @@ return SignalsmithStretch;
       const { start, end } = this._loopBounds();
       if (end - start < 0.05) return;
       if (this._srcOffset >= end - 0.01) return; // started past the loop; progress loop handles it
-      const spliceAt = this._srcStart + (end - this._srcOffset);
+      const rate = this._srcRate;
+      const spliceAt = this._srcStart + (end - this._srcOffset) / rate;
       const token = this._loopToken;
       const delayMs = Math.max(0, (spliceAt - this._ctx.currentTime - 1.0) * 1000);
       this._loopTimer = setTimeout(() => {
@@ -1041,8 +1291,8 @@ return SignalsmithStretch;
           this._startSourcesAt(start);
           return;
         }
-        this._tracks.forEach(t => t.stem && t.stem.start(spliceAt, start));
-        this._segments.push({ at: spliceAt + this._latency, pos: start });
+        this._tracks.forEach(t => t.stem && t.stem.start(spliceAt, start, rate));
+        this._segments.push({ at: spliceAt + this._latency, pos: start, rate });
         this._srcStart = spliceAt;
         this._srcOffset = start;
         this._scheduleLoopSplice();
@@ -1078,7 +1328,9 @@ return SignalsmithStretch;
       this._els.playBtn.innerHTML = ICONS.pause;
 
       const resumed = ctx.state === 'suspended' ? ctx.resume().catch(() => {}) : Promise.resolve();
-      resumed.then(() => this._ensureEngine()).then(() => {
+      resumed.then(() => this._ensureEngine())
+        .then(() => (this._rate !== 1 ? this._ensureClickEngine() : null))
+        .then(() => {
         this._starting = false;
         if (this._cancelStart) {
           this._cancelStart = false;
@@ -1154,7 +1406,7 @@ return SignalsmithStretch;
       this._loopRegion = { start, end };
       this._loop = true;
       this._els.loopBtn.classList.add('active');
-      this._els.loopClearBtn.style.display = 'flex';
+      this._els.loopClearBtn.classList.add('shown');
       this._previewLoopRegion(start / this._duration, end / this._duration);
 
       if (this._isPlaying) {
@@ -1172,7 +1424,7 @@ return SignalsmithStretch;
     clearLoopRegion() {
       this._loopRegion = null;
       if (this._els) {
-        this._els.loopClearBtn.style.display = 'none';
+        this._els.loopClearBtn.classList.remove('shown');
         this._els.loopRegionEl.style.display = 'none';
       }
       this._tracks.forEach(t => {
@@ -1252,17 +1504,57 @@ return SignalsmithStretch;
     _setTitle(title) {
       this._songTitle = title;
       if (this._els && this._els.title) this._els.title.textContent = title;
+      if (this._els && this._els.playerEl) this._els.playerEl.setAttribute('aria-label', 'PracticeMix player: ' + title);
     }
 
     _render() {
+      // Fonts declared inside a shadow root aren't reliably usable in every
+      // browser, so also load them once on the host page.
+      if (!document.getElementById('egsource-practicemix-fonts')) {
+        const link = document.createElement('link');
+        link.id = 'egsource-practicemix-fonts';
+        link.rel = 'stylesheet';
+        link.href = 'https://fonts.googleapis.com/css2?family=Manrope:wght@400;600;700&family=JetBrains+Mono:wght@400;500&family=Inter:wght@300;500&display=swap';
+        document.head.appendChild(link);
+      }
       const style = document.createElement('style');
       style.textContent = `
-        @import url('https://fonts.googleapis.com/css2?family=Manrope:wght@400;600;700&family=JetBrains+Mono:wght@400;500&display=swap');
+        @import url('https://fonts.googleapis.com/css2?family=Manrope:wght@400;600;700&family=JetBrains+Mono:wght@400;500&family=Inter:wght@300;500&display=swap');
         :host { display:block; font-family: 'Manrope', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; }
-        .player { background:${COLORS.bg}; border-radius:6px; overflow:hidden; }
+        .player { background:${COLORS.bg}; border-radius:6px; overflow:hidden; container-type:inline-size; }
         .transport {
-          display:flex; align-items:center; gap:14px; padding:14px 18px;
-          background:${COLORS.controlsBg}; color:${COLORS.text}; flex-wrap:wrap;
+          display:flex; align-items:center; gap:10px; padding:12px 16px;
+          background:${COLORS.controlsBg}; color:${COLORS.text}; flex-wrap:nowrap;
+          font-family:'Helvetica Neue', Helvetica, Inter, Arial, sans-serif;
+        }
+        .row-break { display:none; }
+        /* The song title is hidden unless the embed adds show-title (the song
+           page already shows it). It stays available to screen readers. */
+        :host(:not([show-title])) .song-title { display:none; }
+        /* Two rows: controls on top, full-width playhead underneath.
+           Without a title this is only needed on phones. */
+        @container (max-width: 560px) {
+          .transport { flex-wrap:wrap; padding:10px 12px; gap:8px; row-gap:10px; }
+          .row-break.before-time { display:block; flex-basis:100%; height:0; order:9; }
+          .transport [data-role="current"] { order:10; }
+          .transport .scrubber { order:11; }
+          .transport [data-role="total"] { order:12; }
+          :host(:not([show-title])) .transpose { margin-left:auto; }
+        }
+        /* With show-title, switch to two rows sooner to make room for it */
+        @container (max-width: 800px) {
+          :host([show-title]) .transport { flex-wrap:wrap; padding:10px 14px; gap:8px; row-gap:10px; }
+          :host([show-title]) .song-title { flex:1 1 0; }
+          :host([show-title]) .row-break.before-time { display:block; flex-basis:100%; height:0; order:9; }
+          :host([show-title]) .transport [data-role="current"] { order:10; }
+          :host([show-title]) .transport .scrubber { order:11; }
+          :host([show-title]) .transport [data-role="total"] { order:12; }
+        }
+        /* With show-title on phones: title line, then key + speed, then playhead */
+        @container (max-width: 480px) {
+          :host([show-title]) .row-break.after-title { display:block; flex-basis:100%; height:0; order:5; }
+          :host([show-title]) .transpose { order:6; }
+          :host([show-title]) .speed-wrap { order:7; margin-left:auto; }
         }
         .icon-btn { background:none; border:none; color:${COLORS.text}; cursor:pointer; display:flex; padding:4px; opacity:0.9; }
         .icon-btn:hover { opacity:1; }
@@ -1277,54 +1569,139 @@ return SignalsmithStretch;
         .mix-btn:hover { border-color:#666; color:${COLORS.text}; }
         .mix-btn.solo-btn.active { background:${COLORS.accent}; border-color:${COLORS.accent}; color:#0a0a0a; }
         .mix-btn.mute-btn.active { background:#e85b5b; border-color:#e85b5b; color:#0a0a0a; }
-        .song-title { font-size:15px; font-weight:700; margin-right:8px; white-space:nowrap; }
-        .time { font-family: 'JetBrains Mono', monospace; font-size:13px; color:${COLORS.subtext}; min-width:36px; text-align:center; }
-        .scrubber { position:relative; flex:1; min-width:120px; height:20px; display:flex; align-items:center; cursor:pointer; }
+        .song-title { font-size:15px; font-weight:500; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; min-width:0; flex:0 1 auto; margin-right:4px; }
+        .time { font-size:13px; font-weight:400; color:#c4c4c4; min-width:32px; text-align:center; font-variant-numeric:tabular-nums; flex-shrink:0; }
+        .scrubber { position:relative; flex:1 1 auto; min-width:60px; height:20px; display:flex; align-items:center; cursor:pointer; }
         .scrubber-track { position:relative; width:100%; height:3px; background:#4a4a4a; border-radius:2px; }
         .scrubber-fill { position:absolute; left:0; top:0; height:100%; background:${COLORS.subtext}; border-radius:2px; width:0%; }
-        .scrubber-handle { position:absolute; top:50%; width:12px; height:12px; border-radius:50%; background:${COLORS.text}; transform:translate(-50%,-50%); left:0%; }
+        .scrubber-handle { position:absolute; top:50%; width:12px; height:12px; border-radius:50%; background:${COLORS.text}; transform:translate(-50%,-50%); left:0%; z-index:3; pointer-events:none; }
+        .cue-layer { position:absolute; inset:0; z-index:2; pointer-events:none; }
+        .cue-dot {
+          position:absolute; top:50%; width:8px; height:8px; padding:0; margin:0; border-radius:50%;
+          background:${COLORS.accent}; border:1.5px solid ${COLORS.controlsBg}; transform:translate(-50%,-50%);
+          cursor:pointer; pointer-events:auto; box-sizing:content-box;
+          transition: box-shadow .2s ease, transform .1s ease;
+        }
+        .cue-dot::before { content:''; position:absolute; left:50%; top:50%; width:24px; height:24px; transform:translate(-50%,-50%); border-radius:50%; }
+        @media (hover: hover) { .cue-dot:hover { box-shadow:0 0 8px rgba(34,255,222,0.8); transform:translate(-50%,-50%) scale(1.25); } }
+        .cue-dot:focus-visible { outline:2px solid rgba(34,255,222,0.7); outline-offset:2px; }
         .loop-region { position:absolute; top:-7px; height:17px; background:rgba(34,255,222,0.22); border-left:2px solid ${COLORS.accent}; border-right:2px solid ${COLORS.accent}; border-radius:2px; display:none; pointer-events:none; }
-        .loop-clear-btn { background:none; border:none; color:${COLORS.subtext}; cursor:pointer; font-size:16px; line-height:1; padding:2px 4px; display:none; }
+        .loop-clear-btn { background:none; border:none; color:${COLORS.subtext}; cursor:pointer; font-size:16px; line-height:1; padding:2px 4px; display:inline-flex; visibility:hidden; opacity:0; flex-shrink:0; }
+        .loop-clear-btn.shown { visibility:visible; opacity:1; }
         .loop-clear-btn:hover { color:${COLORS.text}; }
-        .transpose { display:flex; align-items:center; gap:8px; padding-left:8px; border-left:1px solid #3a3a3a; }
-        .transpose-label { font-family: 'JetBrains Mono', monospace; font-size:12px; color:${COLORS.subtext}; min-width:110px; text-align:center; }
-        .transpose-btn { background:#333; border:1px solid #4a4a4a; color:${COLORS.text}; width:24px; height:24px; border-radius:4px; cursor:pointer; font-size:15px; line-height:1; }
+        .transpose { display:flex; align-items:center; gap:5px; flex-shrink:0; }
+        .transpose-label { font-size:13px; font-weight:400; color:#c4c4c4; width:62px; text-align:center; white-space:nowrap; overflow:hidden; }
+        .transpose-label .k-from { color:#c4c4c4; }
+        .transpose-label .k-arrow { color:#8a8a8a; margin:0 4px; }
+        .transpose-label .k-to { color:${COLORS.accent}; text-shadow:0 0 8px rgba(34,255,222,0.45); }
+        .pick-wrap { position:relative; display:inline-flex; align-items:center; flex-shrink:0; }
+        /* Invisible native dropdown over the label: one tap opens the
+           phone's picker. 16px font stops iPhone zooming in on tap. */
+        .overlay-select {
+          position:absolute; inset:0; width:100%; height:100%; opacity:0; cursor:pointer;
+          font-size:16px; -webkit-appearance:none; appearance:none; border:0; margin:0; color-scheme:dark;
+        }
+        .overlay-select:disabled { cursor:default; }
+        .overlay-select option { background:#232323; color:${COLORS.text}; }
+        .speed-wrap.disabled .speed-select { opacity:0.35; }
+        .pick-wrap:focus-within { outline:2px solid rgba(34,255,222,0.7); outline-offset:2px; border-radius:4px; }
+        .transpose-btn { background:#2c2c2c; border:1px solid #4a4a4a; color:${COLORS.text}; width:22px; height:22px; border-radius:4px; cursor:pointer; font-family:inherit; font-size:14px; font-weight:300; line-height:1; padding:0; }
         .transpose-btn:hover { background:#444; }
+        .speed-select {
+          display:flex; align-items:center; box-sizing:border-box; white-space:nowrap;
+          -webkit-appearance:none; appearance:none; flex-shrink:0; cursor:pointer;
+          font-family:inherit; font-size:13px; font-weight:400; color:#c4c4c4;
+          width:60px; height:22px; padding:0 17px 0 8px; border:1px solid #4a4a4a; border-radius:4px;
+          background:#2c2c2c url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='8' height='5'%3E%3Cpath d='M0 0l4 5 4-5z' fill='%23c4c4c4'/%3E%3C/svg%3E") no-repeat right 6px center;
+          color-scheme:dark;
+        }
+        .speed-select.changed { color:${COLORS.accent}; border-color:${COLORS.accent}; }
+        /* ---- Hover, press and glow feedback ---- */
+        .icon-btn, .transpose-btn, .speed-select, .mix-btn, .loop-clear-btn {
+          transition: color .15s ease, background-color .15s ease, border-color .15s ease, box-shadow .2s ease, filter .2s ease, transform .1s ease, opacity .15s ease;
+        }
+        .transpose-label { transition: color .2s ease, text-shadow .2s ease; }
+        @media (hover: hover) {
+          .icon-btn:hover { filter: drop-shadow(0 0 5px rgba(255,255,255,0.35)); }
+          .icon-btn.active:hover { filter: drop-shadow(0 0 7px rgba(34,255,222,0.75)); }
+          .loop-clear-btn:hover { filter: drop-shadow(0 0 5px rgba(255,255,255,0.35)); }
+          .transpose-btn:not(:disabled):hover, .speed-wrap:not(.disabled):hover .speed-select, .mix-btn:hover {
+            border-color: rgba(34,255,222,0.55); box-shadow: 0 0 8px rgba(34,255,222,0.22); transform: translateY(-1px);
+          }
+          .transpose-btn:not(:disabled):hover { background:#383838; }
+          .mix-btn.mute-btn:hover { border-color: rgba(232,91,91,0.65); box-shadow: 0 0 8px rgba(232,91,91,0.35); }
+          [data-role="keyWrap"]:hover .transpose-label { text-decoration:underline dotted rgba(196,196,196,0.6); text-underline-offset:4px; }
+        }
+        .icon-btn:active, .transpose-btn:not(:disabled):active, .mix-btn:active, .loop-clear-btn:active { transform: scale(0.92); }
+        /* Selected states glow */
+        .icon-btn.active { filter: drop-shadow(0 0 5px rgba(34,255,222,0.6)); }
+        .mix-btn.solo-btn.active { box-shadow: 0 0 10px rgba(34,255,222,0.55); }
+        .mix-btn.mute-btn.active { box-shadow: 0 0 10px rgba(232,91,91,0.55); }
+        .speed-select.changed { box-shadow: 0 0 8px rgba(34,255,222,0.35); }
+        .icon-btn:focus-visible, .transpose-btn:focus-visible, .speed-select:focus-visible, .mix-btn:focus-visible, .loop-clear-btn:focus-visible {
+          outline: 2px solid rgba(34,255,222,0.7); outline-offset: 2px;
+        }
+        @media (prefers-reduced-motion: reduce) {
+          .icon-btn, .transpose-btn, .speed-select, .mix-btn, .loop-clear-btn, .transpose-label { transition: none; }
+          .icon-btn:active, .transpose-btn:active, .mix-btn:active, .loop-clear-btn:active, .transpose-btn:hover, .speed-wrap:hover .speed-select, .mix-btn:hover { transform: none; }
+        }
         .tracks { background:#000; }
         .track-row { display:flex; align-items:center; padding:10px 18px; border-bottom:1px solid #161616; }
-        .track-controls { display:flex; align-items:center; gap:10px; width:210px; flex-shrink:0; }
+        .track-controls { display:flex; align-items:center; gap:10px; width:auto; flex-shrink:0; margin-right:18px; }
         .vol-slider { width:70px; accent-color:${COLORS.subtext}; }
-        .track-name { color:${COLORS.text}; font-size:13px; font-weight:700; width:110px; flex-shrink:0; letter-spacing:0.3px; }
+        .track-name { color:${COLORS.text}; font-size:13px; font-weight:700; width:88px; flex-shrink:0; letter-spacing:0.3px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
         .no-transpose-tag { display:block; font-family:'Manrope',sans-serif; font-size:9px; font-weight:400; color:${COLORS.subtext}; letter-spacing:0.2px; margin-top:2px; }
         .waveform-wrap { flex:1; height:44px; position:relative; }
         .waveform-wrap:hover { outline: 1px solid #3a3a3a; }
         .waveform-loop-region { position:absolute; top:0; height:100%; background:rgba(34,255,222,0.18); border-left:2px solid ${COLORS.accent}; border-right:2px solid ${COLORS.accent}; display:none; pointer-events:none; }
-        canvas { width:100%; height:100%; display:block; }
+        canvas { width:100%; height:100%; display:block; touch-action:pan-y; }
+        .scrubber { touch-action:pan-y; }
+        /* Narrow players (phones): name + controls on one line, full-width waveform below */
+        @container (max-width: 640px) {
+          .track-row { flex-wrap:wrap; row-gap:8px; padding:10px 14px; }
+          .track-name { order:1; flex:1 1 auto; width:auto; }
+          .track-controls { order:2; width:auto; gap:8px; margin-right:0; }
+          .waveform-wrap { order:3; flex:0 0 100%; }
+        }
         .credit { text-align:right; padding:4px 10px; font-size:10px; color:#555; background:#000; }
       `;
 
       const wrap = document.createElement('div');
       wrap.className = 'player';
+      wrap.setAttribute('role', 'region');
+      wrap.setAttribute('aria-label', 'PracticeMix player');
       wrap.innerHTML = `
         <div class="transport">
           <button class="icon-btn" data-role="play">${ICONS.play}</button>
           <button class="icon-btn" data-role="loop">${ICONS.loop}</button>
           <button class="loop-clear-btn" data-role="loopClear" title="Clear loop section">\u2715</button>
           <div class="song-title" data-role="title"></div>
+          <div class="row-break after-title"></div>
           <div class="time" data-role="current">0:00</div>
           <div class="scrubber" data-role="scrubber">
             <div class="scrubber-track">
               <div class="scrubber-fill" data-role="fill"></div>
               <div class="loop-region" data-role="loopRegion"></div>
+              <div class="cue-layer" data-role="cueLayer"></div>
               <div class="scrubber-handle" data-role="handle"></div>
             </div>
           </div>
           <div class="time" data-role="total">0:00</div>
           <div class="transpose">
-            <button class="transpose-btn" data-role="down">\u2013</button>
-            <div class="transpose-label" data-role="transposeLabel">Original Key</div>
-            <button class="transpose-btn" data-role="up">+</button>
+            <button class="transpose-btn" data-role="down" title="Down a half step" aria-label="Transpose down">\u2013</button>
+            <div class="pick-wrap" data-role="keyWrap">
+              <div class="transpose-label" data-role="transposeLabel">Key</div>
+              <select class="overlay-select" data-role="keySelect" title="Choose a key" aria-label="Choose a key"></select>
+            </div>
+            <button class="transpose-btn" data-role="up" title="Up a half step" aria-label="Transpose up">+</button>
           </div>
+          <div class="pick-wrap speed-wrap" data-role="speedWrap">
+            <div class="speed-select" data-role="speedDisplay" aria-hidden="true">1\u00d7</div>
+            <select class="overlay-select" data-role="speedSelect" title="Playback speed" aria-label="Playback speed">
+              ${SPEED_PRESETS.map(r => `<option value="${r}"${r === 1 ? ' selected' : ''}>${r}\u00d7</option>`).join('')}
+            </select>
+          </div>
+          <div class="row-break before-time"></div>
         </div>
         <div class="tracks" data-role="tracks"></div>
         <div class="credit">EGSource PracticeMix</div>
@@ -1334,6 +1711,8 @@ return SignalsmithStretch;
       this.shadowRoot.appendChild(wrap);
 
       this._els = {
+        playerEl: wrap,
+        cueLayer: wrap.querySelector('[data-role="cueLayer"]'),
         playBtn: wrap.querySelector('[data-role="play"]'),
         loopBtn: wrap.querySelector('[data-role="loop"]'),
         loopClearBtn: wrap.querySelector('[data-role="loopClear"]'),
@@ -1347,7 +1726,12 @@ return SignalsmithStretch;
         tracksWrap: wrap.querySelector('[data-role="tracks"]'),
         transposeLabel: wrap.querySelector('[data-role="transposeLabel"]'),
         transposeUp: wrap.querySelector('[data-role="up"]'),
-        transposeDown: wrap.querySelector('[data-role="down"]')
+        transposeDown: wrap.querySelector('[data-role="down"]'),
+        speedSelect: wrap.querySelector('[data-role="speedSelect"]'),
+        speedDisplay: wrap.querySelector('[data-role="speedDisplay"]'),
+        speedWrap: wrap.querySelector('[data-role="speedWrap"]'),
+        keySelect: wrap.querySelector('[data-role="keySelect"]'),
+        keyWrap: wrap.querySelector('[data-role="keyWrap"]')
       };
 
       this._els.playBtn.addEventListener('click', () => {
@@ -1366,6 +1750,16 @@ return SignalsmithStretch;
         this._targetUseFlats = undefined;
         this.setTransposeSemitones(Math.max(-6, this._semitones - 1));
       });
+      this._els.speedSelect.addEventListener('change', () => {
+        this.setSpeed(parseFloat(this._els.speedSelect.value));
+        this._els.speedSelect.blur();
+      });
+      this._els.keySelect.addEventListener('change', () => {
+        this._targetUseFlats = undefined;
+        this.setTransposeSemitones(parseInt(this._els.keySelect.value, 10));
+        this._els.keySelect.blur();
+      });
+      this._buildKeyOptions();
       this._attachScrubDrag(this._els.scrubber);
       this._els.loopClearBtn.addEventListener('click', () => {
         this.clearLoopRegion();
@@ -1384,7 +1778,9 @@ return SignalsmithStretch;
         if (!this._duration) return;
         const rect = el.getBoundingClientRect();
         const startFrac = Math.max(0, Math.min(1, (e.clientX - rect.left) / rect.width));
-        drag = { startFrac, curFrac: startFrac, moved: false };
+        const path = e.composedPath ? e.composedPath() : [];
+        const dotEl = path.find(nd => nd && nd.classList && nd.classList.contains('cue-dot'));
+        drag = { startFrac, curFrac: startFrac, moved: false, cueSec: dotEl ? parseFloat(dotEl.dataset.sec) : null };
         try { el.setPointerCapture(e.pointerId); } catch (err) { /* ignore */ }
       });
       el.addEventListener('pointermove', (e) => {
@@ -1406,9 +1802,20 @@ return SignalsmithStretch;
           const b = Math.max(drag.startFrac, drag.curFrac);
           this.setLoopRegion(a * this._duration, b * this._duration);
         } else {
-          this.scrubTo(drag.startFrac * this._duration);
+          // A tap on a cue dot jumps to that cue; anywhere else, to that spot
+          this.scrubTo(drag.cueSec != null ? drag.cueSec : drag.startFrac * this._duration);
         }
         drag = null;
+      });
+      el.addEventListener('pointercancel', () => {
+        if (!drag) return;
+        drag = null;
+        if (this._loopRegion) {
+          this._previewLoopRegion(this._loopRegion.start / this._duration, this._loopRegion.end / this._duration);
+        } else {
+          this._els.loopRegionEl.style.display = 'none';
+          this._tracks.forEach(t => { if (t.els && t.els.loopRegionEl) t.els.loopRegionEl.style.display = 'none'; });
+        }
       });
     }
 
@@ -1442,7 +1849,7 @@ return SignalsmithStretch;
             <button class="mix-btn mute-btn" data-i="${i}" data-role="mute" title="Mute">M</button>
             <input type="range" class="vol-slider" data-i="${i}" data-role="vol" min="0" max="1" step="0.01" value="1">
           </div>
-          <div class="track-name">${name}</div>
+          <div class="track-name" title="${name}">${name}</div>
           <div class="waveform-wrap">
             <canvas data-role="canvas"></canvas>
             <div class="waveform-loop-region" data-role="waveformLoopRegion"></div>
@@ -1490,7 +1897,7 @@ return SignalsmithStretch;
       const canvas = t.els.canvas;
       const dpr = window.devicePixelRatio || 1;
       const rect = canvas.getBoundingClientRect();
-      const w = Math.max(200, rect.width || 600);
+      const w = Math.round(rect.width) || 600;
       const h = 44;
       canvas.width = w * dpr;
       canvas.height = h * dpr;

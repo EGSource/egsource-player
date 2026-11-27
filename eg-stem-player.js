@@ -1244,25 +1244,75 @@ return SignalsmithStretch;
     }
 
     // Sets track volumes by name, 0-100 (e.g. {EG1:100, EG2:0}). Clears
-    // every Solo, and un-mutes each track it sets.
-    setMix(levels) {
+    // every Solo, and un-mutes each track it sets. The faders glide to
+    // their new spots (pass {animate:false} to jump instead).
+    setMix(levels, opts) {
       const want = {};
       Object.keys(levels || {}).forEach(k => { want[String(k).toUpperCase()] = levels[k]; });
-      this._tracks.forEach(t => {
+      this._finishMixTween();
+      let animate = !(opts && opts.animate === false);
+      try { if (window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches) animate = false; } catch (e) {}
+      const moves = [];
+      this._tracks.forEach((t, i) => {
         t.solo = false;
         if (t.els) t.els.soloBtn.classList.remove('active');
         const key = String(t.name).toUpperCase();
         if (!(key in want)) return;
         const v = Math.max(0, Math.min(100, Number(want[key]) || 0)) / 100;
         t.mute = false;
-        if (t.els) {
-          t.els.muteBtn.classList.remove('active');
-          t.els.volSlider.value = v;
+        if (t.els) t.els.muteBtn.classList.remove('active');
+        const from = t.els ? parseFloat(t.els.volSlider.value) : (t.stem ? t.stem.volume : v);
+        if (animate && t.els && Math.abs(from - v) > 0.005) moves.push({ i, from, to: v });
+        else {
+          if (t.els) t.els.volSlider.value = v;
+          if (t.stem) t.stem.setVolume(v);
         }
-        if (t.stem) t.stem.setVolume(v);
       });
       this._recomputeGates();
+      if (moves.length) this._startMixTween(moves);
+      else this._drawAllWaveforms();
       this._emitMixChange(false);
+    }
+
+    // Glides faders (and their volumes) with an ease-out, about half a second.
+    _startMixTween(moves) {
+      const DUR = 480;
+      const t0 = performance.now();
+      const ease = (x) => 1 - Math.pow(1 - x, 3);
+      const tw = { moves, raf: 0 };
+      const step = (now) => {
+        const k = Math.min(1, (now - t0) / DUR);
+        const e = ease(k);
+        tw.moves.forEach(m => {
+          const t = this._tracks[m.i];
+          if (!t) return;
+          const v = k >= 1 ? m.to : m.from + (m.to - m.from) * e;
+          if (t.els) t.els.volSlider.value = v;
+          if (t.stem) t.stem.setVolume(v);
+        });
+        this._drawAllWaveforms();
+        if (k < 1) tw.raf = requestAnimationFrame(step);
+        else if (this._mixTween === tw) this._mixTween = null;
+      };
+      this._mixTween = tw;
+      tw.raf = requestAnimationFrame(step);
+    }
+
+    // Snaps any glide in progress to its end, except for the track the
+    // member just grabbed (skipIndex), which stays where their finger is.
+    _finishMixTween(skipIndex) {
+      const tw = this._mixTween;
+      if (!tw) return;
+      cancelAnimationFrame(tw.raf);
+      this._mixTween = null;
+      tw.moves.forEach(m => {
+        if (m.i === skipIndex) return;
+        const t = this._tracks[m.i];
+        if (!t) return;
+        if (t.els) t.els.volSlider.value = m.to;
+        if (t.stem) t.stem.setVolume(m.to);
+      });
+      this._drawAllWaveforms();
     }
 
     // Every track back to 100%, no Solo, no Mute.
@@ -2011,7 +2061,9 @@ return SignalsmithStretch;
           this._recomputeGates();
           this._emitMixChange(true);
         });
+        volSlider.addEventListener('pointerdown', () => this._finishMixTween(i));
         volSlider.addEventListener('input', () => {
+          this._finishMixTween(i);
           const t = this._tracks[i];
           const v = parseFloat(volSlider.value);
           if (t.stem) t.stem.setVolume(v);

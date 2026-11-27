@@ -1180,14 +1180,16 @@ return SignalsmithStretch;
       this._formatSemitones(n); // keeps the tooltip up to date
       lbl.classList.remove('changed');
       const span = (cls, txt) => '<span class="' + cls + '">' + txt + '</span>';
-      const arrow = (up) => span('k-arrow', up ? '\u2192' : '\u2190');
+      // Step arrow: flat, a slanted rise (or drop), flat, then the head.
+      const arrow = (up) => '<svg class="k-arrow ' + (up ? 'up' : 'down') + '" viewBox="0 0 20 12" width="18" height="11" aria-hidden="true">'
+        + (up ? '<path d="M1 10.5H6.5L11 2.5H18.5M15.5 0 18.5 2.5 15.5 5"/>'
+              : '<path d="M1 1.5H6.5L11 9.5H18.5M15.5 7 18.5 9.5 15.5 12"/>') + '</svg>';
       if (this._songKeyIndex !== null) {
         const useFlats = this._songKeyUseFlats;
         const from = noteName(this._songKeyIndex, useFlats);
         const to = noteName(this._songKeyIndex + n, typeof this._targetUseFlats === 'boolean' ? this._targetUseFlats : useFlats);
         if (n === 0) lbl.innerHTML = span('k-from', 'Key: ' + from);
-        else if (n > 0) lbl.innerHTML = span('k-from', from) + arrow(true) + span('k-to', to);
-        else lbl.innerHTML = span('k-to', to) + arrow(false) + span('k-from', from);
+        else lbl.innerHTML = span('k-from', from) + arrow(n > 0) + span('k-to', to);
       } else {
         lbl.innerHTML = n === 0 ? span('k-from', 'Key')
           : span('k-to', (n > 0 ? '+' : '\u2212') + Math.abs(n));
@@ -1693,7 +1695,7 @@ return SignalsmithStretch;
         .transpose { display:flex; align-items:center; gap:5px; flex-shrink:0; }
         .transpose-label { font-size:13px; font-weight:400; color:#c4c4c4; width:62px; text-align:center; white-space:nowrap; overflow:hidden; }
         .transpose-label .k-from { color:#c4c4c4; }
-        .transpose-label .k-arrow { color:#8a8a8a; margin:0 4px; }
+        .transpose-label .k-arrow { display:inline-block; vertical-align:middle; margin:-2px 3px 0; overflow:visible; fill:none; stroke:${COLORS.accent}; stroke-width:1.6; stroke-linecap:round; stroke-linejoin:round; opacity:.9; }
         .transpose-label .k-to { color:${COLORS.accent}; text-shadow:0 0 8px rgba(34,255,222,0.45); }
         .pick-wrap { position:relative; display:inline-flex; align-items:center; flex-shrink:0; }
         /* Invisible native dropdown over the label: one tap opens the
